@@ -1,0 +1,257 @@
+#!/bin/sh
+# launchd-yaml — declarative macOS LaunchAgent management from a YAML file.
+#
+# Renders each agent from YAML via yq+plutil, deploys to ~/Library/LaunchAgents,
+# reloads only what changed (content-diff driven), and prunes agents removed
+# from the YAML. Unchanged agents are never restarted.
+set -eu
+
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+usage() {
+	cat <<'EOF'
+Usage: launchd-yaml [command] [flags]
+
+Render a YAML file of LaunchAgent definitions and deploy them to ~/Library/LaunchAgents.
+
+Commands:
+  apply    Deploy and reload changed agents, prune removed ones (default)
+  diff     Show what would change without making any changes
+  list     List currently managed agents
+
+Flags:
+  -f, --file <path>         YAML file (default: ./launchd.yaml or ~/.config/launchd-yaml/agents.yaml)
+  -d, --dest <path>         LaunchAgents directory (default: ~/Library/LaunchAgents)
+      --state <path>        State directory (default: ~/.cache/launchd-yaml)
+      --self-agent <name>   Agent key to treat as self-hosting (exempt from inline bootout)
+      --dry-run             Show actions without executing them
+  -h, --help                Show this help
+
+YAML format:
+  launchagents:
+    my-agent:
+      Label: com.$USER.my-agent
+      ProgramArguments: [/usr/bin/some-command, --flag]
+      RunAtLoad: true
+
+  $HOME and $USER in string values are substituted at render time.
+
+Examples:
+  launchd-yaml apply
+  launchd-yaml diff --file ~/dotfiles/agents.yaml
+  launchd-yaml apply --self-agent opencode-web
+  launchd-yaml list
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+CMD=""
+YAML=""
+LA_DIR="$HOME/Library/LaunchAgents"
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/launchd-yaml"
+SELF_AGENT=""
+DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		apply|diff|list|help)
+			CMD="$1"
+			shift
+			;;
+		-f|--file)
+			YAML="$2"
+			shift 2
+			;;
+		-d|--dest)
+			LA_DIR="$2"
+			shift 2
+			;;
+		--state)
+			STATE_DIR="$2"
+			shift 2
+			;;
+		--self-agent)
+			SELF_AGENT="$2"
+			shift 2
+			;;
+		--dry-run)
+			DRY_RUN=1
+			shift
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			echo "launchd-yaml: unknown argument: $1" >&2
+			usage >&2
+			exit 1
+			;;
+	esac
+done
+
+# Default command when none given.
+: "${CMD:=apply}"
+
+if [ "$CMD" = "help" ]; then
+	usage
+	exit 0
+fi
+
+MANIFEST="$STATE_DIR/managed.list"
+user="$(id -un)"
+uid_num="$(id -u)"
+
+# ---------------------------------------------------------------------------
+# Config file search (when --file not given)
+# ---------------------------------------------------------------------------
+if [ -z "$YAML" ]; then
+	if [ -f "./launchd.yaml" ]; then
+		YAML="./launchd.yaml"
+	elif [ -f "${HOME}/.config/launchd-yaml/agents.yaml" ]; then
+		YAML="${HOME}/.config/launchd-yaml/agents.yaml"
+	else
+		echo "launchd-yaml: no YAML file found." >&2
+		echo "  Tried: ./launchd.yaml and ~/.config/launchd-yaml/agents.yaml" >&2
+		echo "  Use --file to specify a path." >&2
+		exit 1
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# list — print manifest and exit
+# ---------------------------------------------------------------------------
+if [ "$CMD" = "list" ]; then
+	if [ -f "$MANIFEST" ]; then
+		cat "$MANIFEST"
+	else
+		echo "No managed agents found."
+	fi
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# diff forces dry-run; apply respects --dry-run flag
+# ---------------------------------------------------------------------------
+if [ "$CMD" = "diff" ]; then
+	DRY_RUN=1
+fi
+
+# Render an agent's final plist text to stdout. The trailing newline keeps
+# output byte-identical across runs so unchanged agents never trip the diff.
+render() {
+	yq -o=json ".launchagents.\"$1\"" "$YAML" \
+		| plutil -convert xml1 -o - - \
+		| sed -e "s#\$HOME#$HOME#g" -e "s#\$USER#$user#g"
+	printf '\n'
+}
+
+names="$(yq -r '.launchagents | keys | .[]' "$YAML")"
+
+reloaded=0
+unchanged=0
+pruned=0
+self_changed=0
+
+# ---------------------------------------------------------------------------
+# Prune orphans: agents in the previous manifest no longer in the YAML.
+# ---------------------------------------------------------------------------
+if [ -f "$MANIFEST" ]; then
+	while IFS= read -r old; do
+		[ -n "$old" ] || continue
+		found=0
+		for n in $names; do
+			[ "$n" = "$old" ] && found=1 && break
+		done
+		if [ "$found" -eq 0 ]; then
+			if [ "$DRY_RUN" -eq 1 ]; then
+				echo "Would prune: $old"
+			else
+				if [ -n "$SELF_AGENT" ] && [ "$old" = "$SELF_AGENT" ]; then
+					# Pruning the self-host: an inline bootout would SIGKILL this
+					# process. Remove the plist but leave the running job for a
+					# human to bootout from a terminal.
+					echo "NOTICE: $SELF_AGENT removed from YAML; plist deleted but the running job was NOT booted out (it hosts this apply). Run 'launchctl bootout gui/$uid_num/com.$user.$SELF_AGENT' from a terminal to stop it."
+				else
+					launchctl bootout "gui/$uid_num/com.$user.$old" 2>/dev/null || true
+				fi
+				rm -f "$LA_DIR/$old.plist"
+				echo "Pruned LaunchAgent: $old"
+			fi
+			pruned=$((pruned + 1))
+		fi
+	done < "$MANIFEST"
+fi
+
+# ---------------------------------------------------------------------------
+# Generate + reload each current agent.
+# ---------------------------------------------------------------------------
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+for name in $names; do
+	render "$name" > "$tmp"
+	plist="$LA_DIR/$name.plist"
+	label="gui/$uid_num/com.$user.$name"
+
+	if [ ! -f "$plist" ]; then
+		# New agent: deploy and load it.
+		if [ "$DRY_RUN" -eq 1 ]; then
+			echo "Would add: $name"
+		else
+			mkdir -p "$LA_DIR"
+			cp "$tmp" "$plist"
+			if ! launchctl print "$label" >/dev/null 2>&1; then
+				launchctl bootstrap "gui/$uid_num" "$plist" 2>/dev/null || true
+			fi
+		fi
+		reloaded=$((reloaded + 1))
+	elif ! cmp -s "$tmp" "$plist"; then
+		# Definition changed: deploy then reload.
+		if [ "$DRY_RUN" -eq 1 ]; then
+			echo "Would reload: $name"
+		else
+			cp "$tmp" "$plist"
+			if [ -n "$SELF_AGENT" ] && [ "$name" = "$SELF_AGENT" ]; then
+				# This agent hosts the running apply session. A synchronous
+				# bootout would SIGKILL this process AND defeat KeepAlive.
+				# Defer a launchd-driven kickstart to the end instead.
+				self_changed=1
+			else
+				launchctl bootout "$label" 2>/dev/null || true
+				launchctl bootstrap "gui/$uid_num" "$plist" 2>/dev/null || true
+			fi
+		fi
+		reloaded=$((reloaded + 1))
+	else
+		# Content identical: ensure it's loaded (handles fresh machine).
+		if [ "$DRY_RUN" -eq 0 ]; then
+			if ! launchctl print "$label" >/dev/null 2>&1; then
+				launchctl bootstrap "gui/$uid_num" "$plist" 2>/dev/null || true
+			fi
+		fi
+		unchanged=$((unchanged + 1))
+	fi
+done
+
+# ---------------------------------------------------------------------------
+# Record the current set so the next run can detect orphans.
+# ---------------------------------------------------------------------------
+if [ "$DRY_RUN" -eq 0 ]; then
+	mkdir -p "$STATE_DIR"
+	printf '%s\n' $names > "$MANIFEST"
+fi
+
+echo "LaunchAgents: $reloaded reloaded, $unchanged unchanged, $pruned pruned."
+
+# ---------------------------------------------------------------------------
+# Self-host deferred reload (apply only, never diff).
+# ---------------------------------------------------------------------------
+if [ "$DRY_RUN" -eq 0 ] && [ "$self_changed" -eq 1 ]; then
+	echo "$SELF_AGENT plist changed — relaunching via 'launchctl kickstart -k' (launchd-driven, survives this session)."
+	echo "NOTE: kickstart reuses the cached job config; new args/env/port go live at next login/reboot, or run a manual bootout+bootstrap from a terminal to apply immediately."
+	launchctl kickstart -k "gui/$uid_num/com.$user.$SELF_AGENT" 2>/dev/null || true
+fi
