@@ -1,0 +1,6 @@
+launchagents:
+  selfhost:
+    Label: com.$USER.selfhost
+    ProgramArguments: [/usr/bin/true]
+    RunAtLoad: true
+    KeepAlive: true

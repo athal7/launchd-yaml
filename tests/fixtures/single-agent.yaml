@@ -1,0 +1,6 @@
+launchagents:
+  demo:
+    Label: com.$USER.demo
+    ProgramArguments: [/usr/bin/true]
+    RunAtLoad: true
+    KeepAlive: true

@@ -1,0 +1,13 @@
+launchagents:
+  newone:
+    Label: com.$USER.newone
+    ProgramArguments: [/usr/bin/true]
+    RunAtLoad: true
+  changedone:
+    Label: com.$USER.changedone
+    ProgramArguments: [/usr/bin/true]
+    RunAtLoad: true
+  unchangedone:
+    Label: com.$USER.unchangedone
+    ProgramArguments: [/usr/bin/true]
+    RunAtLoad: true
