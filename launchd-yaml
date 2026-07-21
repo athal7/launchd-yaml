@@ -149,11 +149,77 @@ render() {
 	printf '\n'
 }
 
+# ---------------------------------------------------------------------------
+# Reload helpers: confirm a bootout/bootstrap actually landed in the launchd
+# domain instead of trusting a discarded exit code. See
+# openspec/changes/fix-reload-after-apply/design.md Decision 1.
+# ---------------------------------------------------------------------------
+
+# wait_for_bootout <label>
+# Polls `launchctl print <label>` every 0.25s until it reports the label
+# gone, or WFB_ATTEMPTS (default 60, ~15s) is exhausted. Returns 1 on
+# timeout — callers treat that as a warning, not a hard failure, since a
+# slow-to-drain registration isn't necessarily a stuck one.
+wait_for_bootout() {
+	wfb_label="$1"
+	wfb_attempts="${WFB_ATTEMPTS:-60}"
+	wfb_i=0
+	while [ "$wfb_i" -lt "$wfb_attempts" ]; do
+		if ! launchctl print "$wfb_label" >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 0.25
+		wfb_i=$((wfb_i + 1))
+	done
+	return 1
+}
+
+# bootstrap_agent <label> <domain> <plist> <name>
+# Runs `bootstrap` then confirms via `print`, retrying up to 3 times with a
+# 0.5s gap. Returns 0 only once `print` confirms the label is loaded; on
+# exhaustion prints an ERROR: line naming the agent and returns 1.
+bootstrap_agent() {
+	ba_label="$1"
+	ba_domain="$2"
+	ba_plist="$3"
+	ba_name="$4"
+	ba_try=1
+	while [ "$ba_try" -le 3 ]; do
+		launchctl bootstrap "$ba_domain" "$ba_plist" 2>/dev/null || true
+		if launchctl print "$ba_label" >/dev/null 2>&1; then
+			return 0
+		fi
+		ba_try=$((ba_try + 1))
+		if [ "$ba_try" -le 3 ]; then
+			sleep 0.5
+		fi
+	done
+	echo "ERROR: $ba_name did not confirm loaded after bootstrap (label: $ba_label)" >&2
+	return 1
+}
+
+# reload_agent <label> <domain> <plist> <name>
+# Composes bootout -> wait_for_bootout -> bootstrap_agent for the
+# changed-agent (non-self) path: the one call site that tears down a prior
+# registration before redeploying the replacement.
+reload_agent() {
+	ra_label="$1"
+	ra_domain="$2"
+	ra_plist="$3"
+	ra_name="$4"
+	launchctl bootout "$ra_label" 2>/dev/null || true
+	if ! wait_for_bootout "$ra_label"; then
+		echo "WARNING: $ra_name's prior registration did not clear within the timeout; attempting bootstrap anyway" >&2
+	fi
+	bootstrap_agent "$ra_label" "$ra_domain" "$ra_plist" "$ra_name"
+}
+
 names="$(yq -r '.launchagents | keys | .[]' "$YAML")"
 
 reloaded=0
 unchanged=0
 pruned=0
+failed=0
 self_changed=0
 
 # ---------------------------------------------------------------------------
@@ -195,24 +261,30 @@ trap 'rm -f "$tmp"' EXIT
 for name in $names; do
 	render "$name" > "$tmp"
 	plist="$LA_DIR/$name.plist"
-	label="gui/$uid_num/com.$user.$name"
+	domain="gui/$uid_num"
+	label="$domain/com.$user.$name"
 
 	if [ ! -f "$plist" ]; then
 		# New agent: deploy and load it.
 		if [ "$DRY_RUN" -eq 1 ]; then
 			echo "Would add: $name"
+			reloaded=$((reloaded + 1))
 		else
 			mkdir -p "$LA_DIR"
 			cp "$tmp" "$plist"
-			if ! launchctl print "$label" >/dev/null 2>&1; then
-				launchctl bootstrap "gui/$uid_num" "$plist" 2>/dev/null || true
+			if launchctl print "$label" >/dev/null 2>&1; then
+				reloaded=$((reloaded + 1))
+			elif bootstrap_agent "$label" "$domain" "$plist" "$name"; then
+				reloaded=$((reloaded + 1))
+			else
+				failed=$((failed + 1))
 			fi
 		fi
-		reloaded=$((reloaded + 1))
 	elif ! cmp -s "$tmp" "$plist"; then
 		# Definition changed: deploy then reload.
 		if [ "$DRY_RUN" -eq 1 ]; then
 			echo "Would reload: $name"
+			reloaded=$((reloaded + 1))
 		else
 			cp "$tmp" "$plist"
 			if [ -n "$SELF_AGENT" ] && [ "$name" = "$SELF_AGENT" ]; then
@@ -220,20 +292,24 @@ for name in $names; do
 				# bootout would SIGKILL this process AND defeat KeepAlive.
 				# Defer a launchd-driven kickstart to the end instead.
 				self_changed=1
+				reloaded=$((reloaded + 1))
+			elif reload_agent "$label" "$domain" "$plist" "$name"; then
+				reloaded=$((reloaded + 1))
 			else
-				launchctl bootout "$label" 2>/dev/null || true
-				launchctl bootstrap "gui/$uid_num" "$plist" 2>/dev/null || true
+				failed=$((failed + 1))
 			fi
 		fi
-		reloaded=$((reloaded + 1))
 	else
 		# Content identical: ensure it's loaded (handles fresh machine).
-		if [ "$DRY_RUN" -eq 0 ]; then
-			if ! launchctl print "$label" >/dev/null 2>&1; then
-				launchctl bootstrap "gui/$uid_num" "$plist" 2>/dev/null || true
-			fi
+		if [ "$DRY_RUN" -eq 1 ]; then
+			unchanged=$((unchanged + 1))
+		elif launchctl print "$label" >/dev/null 2>&1; then
+			unchanged=$((unchanged + 1))
+		elif bootstrap_agent "$label" "$domain" "$plist" "$name"; then
+			unchanged=$((unchanged + 1))
+		else
+			failed=$((failed + 1))
 		fi
-		unchanged=$((unchanged + 1))
 	fi
 done
 
@@ -245,7 +321,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
 	printf '%s\n' $names > "$MANIFEST"
 fi
 
-echo "LaunchAgents: $reloaded reloaded, $unchanged unchanged, $pruned pruned."
+echo "LaunchAgents: $reloaded reloaded, $unchanged unchanged, $pruned pruned, $failed failed."
 
 # ---------------------------------------------------------------------------
 # Self-host deferred reload (apply only, never diff).
@@ -255,3 +331,9 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$self_changed" -eq 1 ]; then
 	echo "NOTE: kickstart reuses the cached job config; new args/env/port go live at next login/reboot, or run a manual bootout+bootstrap from a terminal to apply immediately."
 	launchctl kickstart -k "gui/$uid_num/com.$user.$SELF_AGENT" 2>/dev/null || true
 fi
+
+if [ "$failed" -gt 0 ]; then
+	exit 1
+fi
+
+exit 0

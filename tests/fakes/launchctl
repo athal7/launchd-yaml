@@ -1,0 +1,109 @@
+#!/bin/sh
+# tests/fakes/launchctl — programmable fake standing in for real launchctl.
+#
+# Put first on PATH by tests/lib/harness.sh. Maintains a "domain" file of
+# currently-loaded labels and an append-only invocation log, both under
+# $LAUNCHCTL_FAKE_STATE. Understands just enough of print/bootout/bootstrap/
+# kickstart to drive the reload-race and retry-confirm scenarios under test.
+# See openspec/changes/fix-reload-after-apply/design.md Decision 7.
+#
+# Fault injection (env vars, read fresh on every invocation):
+#   LAUNCHCTL_FAKE_BOOTOUT_LINGER=N          bootout doesn't clear the label
+#                                             immediately; the next N print
+#                                             polls report it still present.
+#   LAUNCHCTL_FAKE_BOOTSTRAP_FAILS_UNTIL=N   bootstrap fails N times before
+#                                             it succeeds and registers.
+#   LAUNCHCTL_FAKE_LABEL_FOR_PLIST=<target>  the "gui/<uid>/<label>" string
+#                                             bootstrap should register on
+#                                             success (bootstrap's real args
+#                                             carry a plist path, not a
+#                                             label — a real plist parser
+#                                             isn't worth adding here since
+#                                             every fixture in this suite
+#                                             manages exactly one agent at a
+#                                             time).
+set -eu
+
+: "${LAUNCHCTL_FAKE_STATE:?LAUNCHCTL_FAKE_STATE must be set by the test harness}"
+
+domain_file="$LAUNCHCTL_FAKE_STATE/domain"
+log_file="$LAUNCHCTL_FAKE_STATE/log"
+linger_file="$LAUNCHCTL_FAKE_STATE/bootout_linger_countdown"
+fails_file="$LAUNCHCTL_FAKE_STATE/bootstrap_fails_countdown"
+
+touch "$domain_file" "$log_file"
+printf '%s\n' "$*" >>"$log_file"
+
+domain_has() {
+	grep -qxF "$1" "$domain_file"
+}
+
+domain_remove() {
+	grep -vxF "$1" "$domain_file" >"$domain_file.tmp" 2>/dev/null || : >"$domain_file.tmp"
+	mv "$domain_file.tmp" "$domain_file"
+}
+
+domain_add() {
+	if ! domain_has "$1"; then
+		printf '%s\n' "$1" >>"$domain_file"
+	fi
+}
+
+cmd="${1:-}"
+
+case "$cmd" in
+print)
+	target="$2"
+	if [ -f "$linger_file" ]; then
+		remaining="$(cat "$linger_file")"
+		if [ "$remaining" -gt 0 ]; then
+			remaining=$((remaining - 1))
+			if [ "$remaining" -eq 0 ]; then
+				domain_remove "$target"
+				rm -f "$linger_file"
+			else
+				printf '%s\n' "$remaining" >"$linger_file"
+			fi
+			exit 0
+		fi
+	fi
+	if domain_has "$target"; then
+		exit 0
+	fi
+	exit 1
+	;;
+bootout)
+	target="$2"
+	if ! domain_has "$target"; then
+		exit 1
+	fi
+	if [ "${LAUNCHCTL_FAKE_BOOTOUT_LINGER:-0}" -gt 0 ] 2>/dev/null; then
+		printf '%s\n' "$LAUNCHCTL_FAKE_BOOTOUT_LINGER" >"$linger_file"
+	else
+		domain_remove "$target"
+	fi
+	exit 0
+	;;
+bootstrap)
+	label="${LAUNCHCTL_FAKE_LABEL_FOR_PLIST:?LAUNCHCTL_FAKE_LABEL_FOR_PLIST must be set for a bootstrap call}"
+	if [ -f "$fails_file" ]; then
+		remaining="$(cat "$fails_file")"
+	else
+		remaining="${LAUNCHCTL_FAKE_BOOTSTRAP_FAILS_UNTIL:-0}"
+	fi
+	if [ "$remaining" -gt 0 ]; then
+		remaining=$((remaining - 1))
+		printf '%s\n' "$remaining" >"$fails_file"
+		exit 1
+	fi
+	domain_add "$label"
+	exit 0
+	;;
+kickstart)
+	exit 0
+	;;
+*)
+	echo "launchctl (fake): unsupported command: $cmd" >&2
+	exit 1
+	;;
+esac

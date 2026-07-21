@@ -1,0 +1,21 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        run: brew install yq
+
+      - name: Make launchd-yaml executable
+        run: chmod +x launchd-yaml
+
+      - name: Run test suite
+        run: sh tests/run.sh
