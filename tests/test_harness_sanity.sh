@@ -11,6 +11,9 @@ set -eu
 target="$(agent_target demo)"
 
 if launchctl print "$target" >/dev/null 2>&1; then
+	echo "DEBUG: PATH=$PATH" >&2
+	echo "DEBUG: which launchctl=$(which launchctl 2>&1)" >&2
+	echo "DEBUG: type launchctl=$(type launchctl 2>&1)" >&2
 	echo "expected print to fail before the label is seeded" >&2
 	exit 1
 fi
