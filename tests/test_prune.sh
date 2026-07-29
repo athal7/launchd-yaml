@@ -29,7 +29,7 @@ bootout_calls="$(fake_log_count "^bootout $target$")"
 assert_eq 1 "$bootout_calls" "prune should issue exactly one bootout"
 
 print_calls="$(fake_log_count "^print $target$")"
-assert_eq 0 "$print_calls" "prune should never poll print"
+assert_eq 1 "$print_calls" "prune should poll print exactly once to check if loaded"
 
 bootstrap_calls="$(fake_log_count "^bootstrap ")"
 assert_eq 0 "$bootstrap_calls" "prune should never attempt a bootstrap"

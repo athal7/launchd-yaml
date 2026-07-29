@@ -184,8 +184,9 @@ bootstrap_agent() {
 	ba_plist="$3"
 	ba_name="$4"
 	ba_try=1
+	ba_err=""
 	while [ "$ba_try" -le 3 ]; do
-		launchctl bootstrap "$ba_domain" "$ba_plist" 2>/dev/null || true
+		ba_err="$(launchctl bootstrap "$ba_domain" "$ba_plist" 2>&1 >/dev/null)" || true
 		if launchctl print "$ba_label" >/dev/null 2>&1; then
 			return 0
 		fi
@@ -195,6 +196,9 @@ bootstrap_agent() {
 		fi
 	done
 	echo "ERROR: $ba_name did not confirm loaded after bootstrap (label: $ba_label)" >&2
+	if [ -n "$ba_err" ]; then
+		echo "launchctl bootstrap stderr: $ba_err" >&2
+	fi
 	return 1
 }
 
@@ -207,9 +211,16 @@ reload_agent() {
 	ra_domain="$2"
 	ra_plist="$3"
 	ra_name="$4"
-	launchctl bootout "$ra_label" 2>/dev/null || true
-	if ! wait_for_bootout "$ra_label"; then
-		echo "WARNING: $ra_name's prior registration did not clear within the timeout; attempting bootstrap anyway" >&2
+	if launchctl print "$ra_label" >/dev/null 2>&1; then
+		ra_err="$(launchctl bootout "$ra_label" 2>&1 >/dev/null)" || true
+		if [ -n "$ra_err" ]; then
+			echo "ERROR: Failed to bootout $ra_name (label: $ra_label)" >&2
+			echo "launchctl bootout stderr: $ra_err" >&2
+			return 1
+		fi
+		if ! wait_for_bootout "$ra_label"; then
+			echo "WARNING: $ra_name's prior registration did not clear within the timeout; attempting bootstrap anyway" >&2
+		fi
 	fi
 	bootstrap_agent "$ra_label" "$ra_domain" "$ra_plist" "$ra_name"
 }
@@ -242,7 +253,15 @@ if [ -f "$MANIFEST" ]; then
 					# human to bootout from a terminal.
 					echo "NOTICE: $SELF_AGENT removed from YAML; plist deleted but the running job was NOT booted out (it hosts this apply). Run 'launchctl bootout gui/$uid_num/com.$user.$SELF_AGENT' from a terminal to stop it."
 				else
-					launchctl bootout "gui/$uid_num/com.$user.$old" 2>/dev/null || true
+					old_label="gui/$uid_num/com.$user.$old"
+					if launchctl print "$old_label" >/dev/null 2>&1; then
+						old_err="$(launchctl bootout "$old_label" 2>&1 >/dev/null)" || true
+						if [ -n "$old_err" ]; then
+							echo "ERROR: Failed to bootout pruned agent $old (label: $old_label)" >&2
+							echo "launchctl bootout stderr: $old_err" >&2
+							failed=$((failed + 1))
+						fi
+					fi
 				fi
 				rm -f "$LA_DIR/$old.plist"
 				echo "Pruned LaunchAgent: $old"
@@ -329,7 +348,13 @@ echo "LaunchAgents: $reloaded reloaded, $unchanged unchanged, $pruned pruned, $f
 if [ "$DRY_RUN" -eq 0 ] && [ "$self_changed" -eq 1 ]; then
 	echo "$SELF_AGENT plist changed — relaunching via 'launchctl kickstart -k' (launchd-driven, survives this session)."
 	echo "NOTE: kickstart reuses the cached job config; new args/env/port go live at next login/reboot, or run a manual bootout+bootstrap from a terminal to apply immediately."
-	launchctl kickstart -k "gui/$uid_num/com.$user.$SELF_AGENT" 2>/dev/null || true
+	kickstart_label="gui/$uid_num/com.$user.$SELF_AGENT"
+	kickstart_err="$(launchctl kickstart -k "$kickstart_label" 2>&1 >/dev/null)" || true
+	if [ -n "$kickstart_err" ]; then
+		echo "ERROR: Failed to kickstart self-agent $SELF_AGENT (label: $kickstart_label)" >&2
+		echo "launchctl kickstart stderr: $kickstart_err" >&2
+		failed=$((failed + 1))
+	fi
 fi
 
 if [ "$failed" -gt 0 ]; then

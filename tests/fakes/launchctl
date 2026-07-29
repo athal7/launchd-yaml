@@ -74,6 +74,10 @@ print)
 	;;
 bootout)
 	target="$2"
+	if [ "${LAUNCHCTL_FAKE_BOOTOUT_FAILS:-0}" -eq 1 ]; then
+		echo "launchctl bootout: mock failure error" >&2
+		exit 1
+	fi
 	if ! domain_has "$target"; then
 		exit 1
 	fi
@@ -100,6 +104,10 @@ bootstrap)
 	exit 0
 	;;
 kickstart)
+	if [ "${LAUNCHCTL_FAKE_KICKSTART_FAILS:-0}" -eq 1 ]; then
+		echo "launchctl kickstart: mock failure error" >&2
+		exit 1
+	fi
 	exit 0
 	;;
 *)
