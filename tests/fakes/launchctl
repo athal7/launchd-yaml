@@ -22,6 +22,10 @@
 #                                             every fixture in this suite
 #                                             manages exactly one agent at a
 #                                             time).
+#   LAUNCHCTL_FAKE_BOOTOUT_FAILS_SILENT=1    bootout fails (exit 1) without
+#                                             printing to stderr (silent fail).
+#   LAUNCHCTL_FAKE_KICKSTART_FAILS_SILENT=1  kickstart fails (exit 1) without
+#                                             printing to stderr (silent fail).
 set -eu
 
 : "${LAUNCHCTL_FAKE_STATE:?LAUNCHCTL_FAKE_STATE must be set by the test harness}"
@@ -78,6 +82,9 @@ bootout)
 		echo "launchctl bootout: mock failure error" >&2
 		exit 1
 	fi
+	if [ "${LAUNCHCTL_FAKE_BOOTOUT_FAILS_SILENT:-0}" -eq 1 ]; then
+		exit 1
+	fi
 	if ! domain_has "$target"; then
 		exit 1
 	fi
@@ -106,6 +113,9 @@ bootstrap)
 kickstart)
 	if [ "${LAUNCHCTL_FAKE_KICKSTART_FAILS:-0}" -eq 1 ]; then
 		echo "launchctl kickstart: mock failure error" >&2
+		exit 1
+	fi
+	if [ "${LAUNCHCTL_FAKE_KICKSTART_FAILS_SILENT:-0}" -eq 1 ]; then
 		exit 1
 	fi
 	exit 0

@@ -212,10 +212,12 @@ reload_agent() {
 	ra_plist="$3"
 	ra_name="$4"
 	if launchctl print "$ra_label" >/dev/null 2>&1; then
-		ra_err="$(launchctl bootout "$ra_label" 2>&1 >/dev/null)" || true
-		if [ -n "$ra_err" ]; then
+		ra_err="$(launchctl bootout "$ra_label" 2>&1 >/dev/null)" || ra_exit=$?
+		if [ "${ra_exit:-0}" -ne 0 ]; then
 			echo "ERROR: Failed to bootout $ra_name (label: $ra_label)" >&2
-			echo "launchctl bootout stderr: $ra_err" >&2
+			if [ -n "$ra_err" ]; then
+				echo "launchctl bootout stderr: $ra_err" >&2
+			fi
 			return 1
 		fi
 		if ! wait_for_bootout "$ra_label"; then
@@ -255,10 +257,12 @@ if [ -f "$MANIFEST" ]; then
 				else
 					old_label="gui/$uid_num/com.$user.$old"
 					if launchctl print "$old_label" >/dev/null 2>&1; then
-						old_err="$(launchctl bootout "$old_label" 2>&1 >/dev/null)" || true
-						if [ -n "$old_err" ]; then
+						old_err="$(launchctl bootout "$old_label" 2>&1 >/dev/null)" || old_exit=$?
+						if [ "${old_exit:-0}" -ne 0 ]; then
 							echo "ERROR: Failed to bootout pruned agent $old (label: $old_label)" >&2
-							echo "launchctl bootout stderr: $old_err" >&2
+							if [ -n "$old_err" ]; then
+								echo "launchctl bootout stderr: $old_err" >&2
+							fi
 							failed=$((failed + 1))
 						fi
 					fi
@@ -349,10 +353,12 @@ if [ "$DRY_RUN" -eq 0 ] && [ "$self_changed" -eq 1 ]; then
 	echo "$SELF_AGENT plist changed — relaunching via 'launchctl kickstart -k' (launchd-driven, survives this session)."
 	echo "NOTE: kickstart reuses the cached job config; new args/env/port go live at next login/reboot, or run a manual bootout+bootstrap from a terminal to apply immediately."
 	kickstart_label="gui/$uid_num/com.$user.$SELF_AGENT"
-	kickstart_err="$(launchctl kickstart -k "$kickstart_label" 2>&1 >/dev/null)" || true
-	if [ -n "$kickstart_err" ]; then
+	kickstart_err="$(launchctl kickstart -k "$kickstart_label" 2>&1 >/dev/null)" || kickstart_exit=$?
+	if [ "${kickstart_exit:-0}" -ne 0 ]; then
 		echo "ERROR: Failed to kickstart self-agent $SELF_AGENT (label: $kickstart_label)" >&2
-		echo "launchctl kickstart stderr: $kickstart_err" >&2
+		if [ -n "$kickstart_err" ]; then
+			echo "launchctl kickstart stderr: $kickstart_err" >&2
+		fi
 		failed=$((failed + 1))
 	fi
 fi
